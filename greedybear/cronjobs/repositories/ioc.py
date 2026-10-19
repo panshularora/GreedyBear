@@ -1,7 +1,8 @@
 import logging
+from collections.abc import Callable
 
 from django.contrib.postgres.aggregates import ArrayAgg
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import F
 
 from greedybear.models import IOC, Honeypot
@@ -125,6 +126,62 @@ class IocRepository:
         """
         try:
             return IOC.objects.prefetch_related("honeypots").get(name=name)
+        except IOC.DoesNotExist:
+            return None
+
+    def upsert_ioc(self, ioc: IOC, apply_changes: Callable[[IOC, bool], IOC]) -> IOC:
+        """
+        Create or update an IOC as a single concurrency-safe unit.
+
+        Resolves the IOC by name and holds a row lock on it while the caller
+        applies its changes, so concurrent ingestion flows neither fail on the
+        unique constraint of `IOC.name` nor overwrite each other's aggregates.
+
+        If no IOC with this name exists, `ioc` is inserted as the new record.
+        If another flow inserts the same name first, the insert is rolled back
+        to a savepoint and the now existing record is locked and used instead.
+
+        Args:
+            ioc: The incoming, unsaved IOC instance.
+            apply_changes: Called with the locked record and whether it was
+                just created from `ioc`. It must return the record to save.
+                It is called exactly once.
+
+        Returns:
+            The saved IOC record.
+        """
+        with transaction.atomic():
+            created = False
+            record = self._get_ioc_for_update(ioc.name)
+            if record is None:
+                try:
+                    # savepoint, so a failed insert does not abort the outer transaction
+                    with transaction.atomic():
+                        ioc.save(force_insert=True)
+                    record, created = ioc, True
+                except IntegrityError:
+                    # another flow created this IOC after our lookup
+                    record = self._get_ioc_for_update(ioc.name)
+                    if record is None:
+                        raise
+                    self.log.debug(f"{ioc} was created concurrently - updating record")
+            record = apply_changes(record, created)
+            record.save()
+        return record
+
+    def _get_ioc_for_update(self, name: str) -> IOC | None:
+        """
+        Retrieve an IOC by its name and lock its row until the end of the transaction.
+        Must be called inside a transaction.
+
+        Args:
+            name: The IOC name to look up.
+
+        Returns:
+            The locked IOC, or None if not found.
+        """
+        try:
+            return IOC.objects.select_for_update().prefetch_related("honeypots").get(name=name)
         except IOC.DoesNotExist:
             return None
 

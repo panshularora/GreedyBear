@@ -57,27 +57,28 @@ class IocProcessor:
             self.log.debug(f"not saved {ioc} because it is a whats-my-ip domain")
             return None
 
-        ioc_record = self.ioc_repo.get_ioc_by_name(ioc.name)
-        if ioc_record is None:  # Create
-            self.log.debug(f"{ioc} was not seen before - creating a new record")
-            ioc_record = self.ioc_repo.save(ioc)
-            # Add sensors to newly saved IOC from temporary attribute.
-            # (See greedybear/cronjobs/extraction/utils.py for why we use this)
-            if hasattr(ioc, "_sensors_to_add") and ioc._sensors_to_add:
-                ioc_record.sensors.add(*ioc._sensors_to_add)
-        else:  # Update - sensors handled inside _merge_iocs
-            self.log.debug(f"{ioc} is already known - updating record")
-            ioc_record = self._merge_iocs(ioc_record, ioc)
+        def apply_changes(ioc_record: IOC, created: bool) -> IOC:
+            if created:
+                self.log.debug(f"{ioc} was not seen before - creating a new record")
+                # Add sensors to newly saved IOC from temporary attribute.
+                # (See greedybear/cronjobs/extraction/utils.py for why we use this)
+                if hasattr(ioc, "_sensors_to_add") and ioc._sensors_to_add:
+                    ioc_record.sensors.add(*ioc._sensors_to_add)
+            else:  # Update - sensors handled inside _merge_iocs
+                self.log.debug(f"{ioc} is already known - updating record")
+                ioc_record = self._merge_iocs(ioc_record, ioc)
 
-        if honeypot_name is not None:
-            ioc_record = self.ioc_repo.add_honeypot_to_ioc(honeypot_name, ioc_record)
+            if honeypot_name is not None:
+                ioc_record = self.ioc_repo.add_honeypot_to_ioc(honeypot_name, ioc_record)
 
-        ioc_record = self._update_days_seen(ioc_record)
-        ioc_record.scanner = ioc_record.scanner or (attack_type == SCANNER)
-        ioc_record.payload_request = ioc_record.payload_request or (attack_type == PAYLOAD_REQUEST)
+            ioc_record = self._update_days_seen(ioc_record)
+            ioc_record.scanner = ioc_record.scanner or (attack_type == SCANNER)
+            ioc_record.payload_request = ioc_record.payload_request or (attack_type == PAYLOAD_REQUEST)
+            return ioc_record
 
-        self.ioc_repo.save(ioc_record)
-        return ioc_record
+        # Identity resolution, merging and saving happen under a row lock,
+        # so concurrent ingestion flows cannot create or update the same IOC twice.
+        return self.ioc_repo.upsert_ioc(ioc, apply_changes)
 
     def _merge_iocs(self, existing: IOC, new: IOC) -> IOC:
         """

@@ -13,6 +13,14 @@ class TestAddIoc(ExtractionTestCase):
     def setUp(self):
         super().setUp()
         self.processor = IocProcessor(self.mock_ioc_repo, self.mock_sensor_repo)
+        self.existing_record = None
+        self.mock_ioc_repo.upsert_ioc.side_effect = self._fake_upsert_ioc
+
+    def _fake_upsert_ioc(self, ioc, apply_changes):
+        """Emulate IocRepository.upsert_ioc: the incoming IOC becomes the record unless one exists."""
+        if self.existing_record is None:
+            return apply_changes(ioc, True)
+        return apply_changes(self.existing_record, False)
 
     def test_filters_sensor_ips(self):
         self.mock_sensor_repo.cache = {"192.168.1.1": Mock()}
@@ -21,7 +29,7 @@ class TestAddIoc(ExtractionTestCase):
         result = self.processor.add_ioc(ioc, attack_type=SCANNER)
 
         self.assertIsNone(result)
-        self.mock_ioc_repo.save.assert_not_called()
+        self.mock_ioc_repo.upsert_ioc.assert_not_called()
 
     def test_filters_whatsmyip_domains(self):
         self.processor._whatsmyip_domains = {"some.domain.com"}
@@ -30,37 +38,32 @@ class TestAddIoc(ExtractionTestCase):
         result = self.processor.add_ioc(ioc, attack_type=SCANNER)
 
         self.assertIsNone(result)
-        self.mock_ioc_repo.save.assert_not_called()
+        self.mock_ioc_repo.upsert_ioc.assert_not_called()
 
     def test_creates_new_ioc_when_not_exists(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         new_ioc = self._create_mock_ioc()
-        self.mock_ioc_repo.save.return_value = new_ioc
 
         result = self.processor.add_ioc(new_ioc, attack_type=SCANNER)
 
-        self.mock_ioc_repo.get_ioc_by_name.assert_called_once_with("1.2.3.4")
-        self.mock_ioc_repo.save.assert_called()
+        self.mock_ioc_repo.upsert_ioc.assert_called_once()
+        self.assertIs(self.mock_ioc_repo.upsert_ioc.call_args[0][0], new_ioc)
         self.assertIsNotNone(result)
 
     def test_updates_existing_ioc_when_exists(self):
         self.mock_sensor_repo.cache = {}
         existing_ioc = self._create_mock_ioc(attack_count=5)
-        self.mock_ioc_repo.get_ioc_by_name.return_value = existing_ioc
+        self.existing_record = existing_ioc
         new_ioc = self._create_mock_ioc(attack_count=1)
-        self.mock_ioc_repo.save.return_value = existing_ioc
 
         result = self.processor.add_ioc(new_ioc, attack_type=SCANNER)
 
-        self.mock_ioc_repo.get_ioc_by_name.assert_called_once_with("1.2.3.4")
+        self.mock_ioc_repo.upsert_ioc.assert_called_once()
         self.assertEqual(result.attack_count, 6)
 
     def test_sets_scanner_flag_for_scanner_attack_type(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc()
-        self.mock_ioc_repo.save.return_value = ioc
 
         result = self.processor.add_ioc(ioc, attack_type=SCANNER)
 
@@ -69,9 +72,7 @@ class TestAddIoc(ExtractionTestCase):
 
     def test_sets_payload_request_flag_for_payload_attack_type(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc()
-        self.mock_ioc_repo.save.return_value = ioc
 
         result = self.processor.add_ioc(ioc, attack_type=PAYLOAD_REQUEST)
 
@@ -80,9 +81,7 @@ class TestAddIoc(ExtractionTestCase):
 
     def test_adds_honeypot_when_provided(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc()
-        self.mock_ioc_repo.save.return_value = ioc
         self.mock_ioc_repo.add_honeypot_to_ioc.return_value = ioc
 
         self.processor.add_ioc(ioc, attack_type=SCANNER, honeypot_name="TestHoneypot")
@@ -91,9 +90,7 @@ class TestAddIoc(ExtractionTestCase):
 
     def test_skips_honeypot_when_not_provided(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc()
-        self.mock_ioc_repo.save.return_value = ioc
 
         self.processor.add_ioc(ioc, attack_type=SCANNER, honeypot_name=None)
 
@@ -101,13 +98,10 @@ class TestAddIoc(ExtractionTestCase):
 
     def test_adds_sensors_from_attribute(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc()
         sensor1 = Mock()
         sensor2 = Mock()
         ioc._sensors_to_add = [sensor1, sensor2]
-
-        self.mock_ioc_repo.save.return_value = ioc
 
         self.processor.add_ioc(ioc, attack_type=SCANNER)
 
@@ -115,9 +109,7 @@ class TestAddIoc(ExtractionTestCase):
 
     def test_updates_days_seen_on_add(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc(days_seen=[], last_seen=datetime(2025, 1, 1, 12, 0, 0))
-        self.mock_ioc_repo.save.return_value = ioc
 
         result = self.processor.add_ioc(ioc, attack_type=SCANNER)
 
@@ -126,7 +118,6 @@ class TestAddIoc(ExtractionTestCase):
 
     def test_full_create_flow(self):
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
 
         ioc = self._create_mock_ioc(
             name="1.2.3.4",
@@ -135,12 +126,11 @@ class TestAddIoc(ExtractionTestCase):
             days_seen=[],
             last_seen=datetime(2025, 1, 1, 12, 0, 0),
         )
-        self.mock_ioc_repo.save.return_value = ioc
 
         result = self.processor.add_ioc(ioc, attack_type=SCANNER)
 
-        self.mock_ioc_repo.get_ioc_by_name.assert_called_once()
-        self.assertEqual(self.mock_ioc_repo.save.call_count, 2)  # Once for create, once at end
+        self.mock_ioc_repo.upsert_ioc.assert_called_once()
+        self.mock_ioc_repo.get_ioc_by_name.assert_not_called()
         self.assertTrue(result.scanner)
         self.assertEqual(len(result.days_seen), 1)
 
@@ -157,7 +147,7 @@ class TestAddIoc(ExtractionTestCase):
             protocols=["ssh"],
             cves=["CVE-XXXXX-XXXXX"],
         )
-        self.mock_ioc_repo.get_ioc_by_name.return_value = existing
+        self.existing_record = existing
 
         new = self._create_mock_ioc(
             attack_count=1,
@@ -166,8 +156,6 @@ class TestAddIoc(ExtractionTestCase):
             destination_ports=[443],
             last_seen=datetime(2025, 1, 2, 12, 0, 0),
         )
-
-        self.mock_ioc_repo.save.return_value = existing
 
         result = self.processor.add_ioc(new, attack_type=PAYLOAD_REQUEST)
 
@@ -181,13 +169,31 @@ class TestAddIoc(ExtractionTestCase):
     def test_only_checks_whatsmyip_for_domains(self):
         self.processor._whatsmyip_domains = {"1.2.3.4"}
         self.mock_sensor_repo.cache = {}
-        self.mock_ioc_repo.get_ioc_by_name.return_value = None
         ioc = self._create_mock_ioc(name="1.2.3.4", ioc_type=IocType.IP)
-        self.mock_ioc_repo.save.return_value = ioc
 
         result = self.processor.add_ioc(ioc, attack_type=SCANNER)
 
         self.assertIsNotNone(result)
+
+    def test_does_not_merge_newly_created_ioc(self):
+        ioc = self._create_mock_ioc(attack_count=1, interaction_count=3)
+
+        result = self.processor.add_ioc(ioc, attack_type=SCANNER)
+
+        self.assertIs(result, ioc)
+        self.assertEqual(result.attack_count, 1)
+        self.assertEqual(result.interaction_count, 3)
+
+    def test_merges_existing_ioc_exactly_once(self):
+        existing = self._create_mock_ioc(attack_count=5, interaction_count=10)
+        self.existing_record = existing
+        new = self._create_mock_ioc(attack_count=1, interaction_count=3)
+
+        result = self.processor.add_ioc(new, attack_type=SCANNER)
+
+        self.assertIs(result, existing)
+        self.assertEqual(result.attack_count, 6)
+        self.assertEqual(result.interaction_count, 13)
 
 
 class TestMergeIocs(ExtractionTestCase):

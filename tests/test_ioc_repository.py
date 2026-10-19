@@ -1,7 +1,12 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, connections, transaction
+from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 from greedybear.cronjobs.repositories import IocRepository
 from greedybear.enums import IpReputation
@@ -514,6 +519,142 @@ class TestIocRepository(CustomTestCase):
         cached = self.repo._honeypot_cache.get("cachetestpot")
         self.assertIsInstance(cached, Honeypot)
         self.assertEqual(cached.pk, hp.pk)
+
+    def test_upsert_ioc_creates_new_ioc(self):
+        apply_changes = Mock(side_effect=lambda record, created: record)
+        ioc = IOC(name="9.9.9.9", type="ip")
+
+        result = self.repo.upsert_ioc(ioc, apply_changes)
+
+        apply_changes.assert_called_once_with(ioc, True)
+        self.assertIs(result, ioc)
+        self.assertIsNotNone(result.pk)
+        self.assertTrue(IOC.objects.filter(name="9.9.9.9").exists())
+
+    def test_upsert_ioc_updates_existing_ioc(self):
+        existing = IOC.objects.create(name="9.9.9.8", type="ip", attack_count=5)
+        apply_changes = Mock(side_effect=lambda record, created: record)
+
+        def increment(record, created):
+            apply_changes(record, created)
+            record.attack_count += 1
+            return record
+
+        result = self.repo.upsert_ioc(IOC(name="9.9.9.8", type="ip"), increment)
+
+        apply_changes.assert_called_once()
+        record, created = apply_changes.call_args[0]
+        self.assertFalse(created)
+        self.assertEqual(record.pk, existing.pk)
+        self.assertEqual(result.pk, existing.pk)
+        self.assertEqual(IOC.objects.get(name="9.9.9.8").attack_count, 6)
+        self.assertEqual(IOC.objects.filter(name="9.9.9.8").count(), 1)
+
+    def test_upsert_ioc_locks_existing_row(self):
+        IOC.objects.create(name="9.9.9.7", type="ip")
+
+        with CaptureQueriesContext(connection) as ctx:
+            self.repo.upsert_ioc(IOC(name="9.9.9.7", type="ip"), lambda record, created: record)
+
+        self.assertTrue(any("FOR UPDATE" in q["sql"] for q in ctx.captured_queries))
+
+    def test_upsert_ioc_recovers_from_concurrent_create(self):
+        """If another flow inserts the IOC between lookup and insert, the existing row is merged instead."""
+        IOC.objects.create(name="9.9.9.6", type="ip", attack_count=3)
+        real_lookup = self.repo._get_ioc_for_update
+        # first lookup misses, as if the other flow had not committed yet
+        lookups = [None]
+
+        def lookup(name):
+            return lookups.pop() if lookups else real_lookup(name)
+
+        def increment(record, created):
+            self.assertFalse(created)
+            record.attack_count += 1
+            return record
+
+        with patch.object(self.repo, "_get_ioc_for_update", side_effect=lookup):
+            result = self.repo.upsert_ioc(IOC(name="9.9.9.6", type="ip"), increment)
+
+        self.assertEqual(result.attack_count, 4)
+        self.assertEqual(IOC.objects.filter(name="9.9.9.6").count(), 1)
+        self.assertEqual(IOC.objects.get(name="9.9.9.6").attack_count, 4)
+
+    def test_upsert_ioc_reraises_unrelated_integrity_error(self):
+        apply_changes = Mock()
+
+        with (
+            patch.object(IOC, "save", side_effect=IntegrityError("other constraint")),
+            self.assertRaises(IntegrityError),
+        ):
+            self.repo.upsert_ioc(IOC(name="9.9.9.5", type="ip"), apply_changes)
+
+        apply_changes.assert_not_called()
+        self.assertFalse(IOC.objects.filter(name="9.9.9.5").exists())
+
+
+class TestIocRepositoryConcurrency(TransactionTestCase):
+    """
+    Run upsert_ioc from several threads at once.
+
+    Uses TransactionTestCase because each thread has its own database
+    connection and must see committed rows.
+    """
+
+    @staticmethod
+    def _upsert(name, apply_changes, wait_for=None):
+        try:
+            if wait_for is not None:
+                wait_for.wait(timeout=5)
+            return IocRepository().upsert_ioc(IOC(name=name, type="ip"), apply_changes)
+        finally:
+            # close this thread's connection so the test database can be dropped
+            connections.close_all()
+
+    def test_concurrent_updates_are_not_lost(self):
+        IOC.objects.create(name="7.7.7.7", type="ip", attack_count=1)
+        first_has_lock = threading.Event()
+
+        def slow_increment(record, created):
+            first_has_lock.set()
+            time.sleep(0.5)  # give the second flow time to read the row if it were not locked
+            record.attack_count += 1
+            return record
+
+        def increment(record, created):
+            record.attack_count += 1
+            return record
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(self._upsert, "7.7.7.7", slow_increment)
+            second = executor.submit(self._upsert, "7.7.7.7", increment, first_has_lock)
+            first.result()
+            second.result()
+
+        self.assertEqual(IOC.objects.get(name="7.7.7.7").attack_count, 3)
+
+    def test_concurrent_creates_produce_one_record(self):
+        workers = 8
+        barrier = threading.Barrier(workers)
+        created_flags = []
+
+        def count(record, created):
+            created_flags.append(created)
+            if not created:
+                record.attack_count += 1
+            return record
+
+        def run():
+            barrier.wait(timeout=5)
+            return self._upsert("7.7.7.8", count)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for future in [executor.submit(run) for _ in range(workers)]:
+                future.result()
+
+        self.assertEqual(IOC.objects.filter(name="7.7.7.8").count(), 1)
+        self.assertEqual(created_flags.count(True), 1)
+        self.assertEqual(IOC.objects.get(name="7.7.7.8").attack_count, workers)
 
 
 class TestScoringIntegration(CustomTestCase):
